@@ -6,10 +6,17 @@ import logging
 import json
 import sys
 
-OPCODE_DATA = 1
-OPCODE_WAIT = 2
-OPCODE_DONE = 3
-OPCODE_QUIT = 4
+# 서버 -> 엣지 방향의 제어 opcode
+OPCODE_DATA = 1   # (기존) 데이터 보고 opcode
+OPCODE_WAIT = 2   # 학습 단계 종료 후 대기 신호
+OPCODE_DONE = 3   # 한 인스턴스 처리 완료, 다음 데이터 요청
+OPCODE_QUIT = 4   # 전체 종료 신호
+
+# 엣지 payload 내부의 feature mode
+# 실제 네트워크 메시지는 OPCODE_DATA || mode || power_max || feature1 || feature2 || month 형태이다.
+OPCODE_MODE_TEMP = 0      # temp 모드  : power_max || temp_max  || temp_avg  || month
+OPCODE_MODE_HUMID = 1     # humid 모드 : power_max || humid_max || humid_avg || month
+OPCODE_MODE_COMBINED = 2  # combined   : power_max || temp_max  || humid_max || month
 
 class Server:
     def __init__(self, name, algorithm, dimension, index, port, caddr, cport, ntrain, ntest):
@@ -73,6 +80,16 @@ class Server:
             client_handle = threading.Thread(target=self.handler, args=(client,))
             client_handle.start()
 
+    def recv_exact(self, client, size):
+        buf = b""
+        while len(buf) < size:
+            chunk = client.recv(size - len(buf))
+            if not chunk:
+                logging.error("[*] connection closed while receiving data")
+                sys.exit(1)
+            buf += chunk
+        return buf
+
     def send_instance(self, vlst, is_training):
         if is_training:
             url = "http://{}:{}/{}/training".format(self.caddr, self.cport, self.name)
@@ -97,14 +114,28 @@ class Server:
             logging.error("unknown response")
             sys.exit(1)
 
-    def parse_data(self, buf, is_training):
-        temp = int.from_bytes(buf[0:1], byteorder="big", signed=True)
-        humid = int.from_bytes(buf[1:2], byteorder="big", signed=True)
-        power = int.from_bytes(buf[2:4], byteorder="big", signed=True)
+    def parse_data(self, buf, is_training, mode):
+        # 엣지가 보낸 5바이트 payload를 mode와 무관하게 동일한 바이트 레이아웃으로 파싱한다.
+        #   buf[0:2] = power_max (2바이트, 빅엔디안)
+        #   buf[2:3] = feature1  (1바이트)
+        #   buf[3:4] = feature2  (1바이트)
+        #   buf[4:5] = month     (1바이트)
+        power = int.from_bytes(buf[0:2], byteorder="big", signed=True)
+        feature1 = int.from_bytes(buf[2:3], byteorder="big", signed=True)
+        feature2 = int.from_bytes(buf[3:4], byteorder="big", signed=True)
         month = int.from_bytes(buf[4:5], byteorder="big", signed=True)
 
-        lst = [temp, humid, power, month]
-        logging.info("[temp, humid, power, month] = {}".format(lst))
+        # mode에 따라 feature1/feature2의 "의미"만 달라진다(값 위치는 동일). 로그 가독성용 라벨.
+        if mode == OPCODE_MODE_TEMP:
+            label = "[power_max, temp_max, temp_avg, month]"
+        elif mode == OPCODE_MODE_HUMID:
+            label = "[power_max, humid_max, humid_avg, month]"
+        else:
+            label = "[power_max, temp_max, humid_max, month]"
+
+        # AI 모듈로 보낼 인스턴스. 전력값(power)이 index 0에 위치하므로 --index 0 으로 실행한다.
+        lst = [power, feature1, feature2, month]
+        logging.info("{} = {}".format(label, lst))
 
         self.send_instance(lst, is_training)
 
@@ -118,18 +149,29 @@ class Server:
         url = "http://{}:{}/{}/training".format(self.caddr, self.cport, self.name)
 
         while True:
-            # opcode (1 byte): 
-            rbuf = client.recv(1)
+            # Edge protocol:
+            #   OPCODE_DATA (1 byte) || mode (1 byte) || power_max (2 bytes)
+            #   || feature1 (1 byte) || feature2 (1 byte) || month (1 byte)
+            rbuf = self.recv_exact(client, 1)
             opcode = int.from_bytes(rbuf, "big")
             logging.debug("[*] opcode: {}".format(opcode))
 
             if opcode == OPCODE_DATA:
-                logging.info("[*] data report from the edge")
-                rbuf = client.recv(5)
-                logging.debug("[*] received buf: {}".format(rbuf))
-                self.parse_data(rbuf, True)
+                payload = self.recv_exact(client, 6)
+                mode = payload[0]
+                data_buf = payload[1:6]
+
+                if mode not in (OPCODE_MODE_TEMP, OPCODE_MODE_HUMID, OPCODE_MODE_COMBINED):
+                    logging.error("[*] invalid mode: {}".format(mode))
+                    logging.error("[*] please try again")
+                    sys.exit(1)
+
+                logging.info("[*] data report from the edge (mode={})".format(mode))
+                logging.debug("[*] received payload: {}".format(payload))
+                self.parse_data(data_buf, True, mode)
             else:
-                logging.error("[*] invalid opcode")
+                logging.error("[*] invalid opcode: {}".format(opcode))
+                logging.error("[*] expected OPCODE_DATA ({})".format(OPCODE_DATA))
                 logging.error("[*] please try again")
                 sys.exit(1)
 
@@ -156,18 +198,29 @@ class Server:
         client.send(int.to_bytes(opcode, 1, "big"))
 
         while ntest > 0:
-            # opcode (1 byte): 
-            rbuf = client.recv(1)
+            # Edge protocol:
+            #   OPCODE_DATA (1 byte) || mode (1 byte) || power_max (2 bytes)
+            #   || feature1 (1 byte) || feature2 (1 byte) || month (1 byte)
+            rbuf = self.recv_exact(client, 1)
             opcode = int.from_bytes(rbuf, "big")
             logging.debug("[*] opcode: {}".format(opcode))
 
             if opcode == OPCODE_DATA:
-                logging.info("[*] data report from the edge")
-                rbuf = client.recv(5)
-                logging.debug("[*] received buf: {}".format(rbuf))
-                self.parse_data(rbuf, False)
+                payload = self.recv_exact(client, 6)
+                mode = payload[0]
+                data_buf = payload[1:6]
+
+                if mode not in (OPCODE_MODE_TEMP, OPCODE_MODE_HUMID, OPCODE_MODE_COMBINED):
+                    logging.error("[*] invalid mode: {}".format(mode))
+                    logging.error("[*] please try again")
+                    sys.exit(1)
+
+                logging.info("[*] data report from the edge (mode={})".format(mode))
+                logging.debug("[*] received payload: {}".format(payload))
+                self.parse_data(data_buf, False, mode)
             else:
-                logging.error("[*] invalid opcode")
+                logging.error("[*] invalid opcode: {}".format(opcode))
+                logging.error("[*] expected OPCODE_DATA ({})".format(OPCODE_DATA))
                 logging.error("[*] please try again")
                 sys.exit(1)
 
@@ -210,7 +263,7 @@ class Server:
         logging.debug("   prediction: {}".format(result["prediction"]))
         logging.info("   correct predictions: {}".format(result["correct"]))
         logging.info("   incorrect predictions: {}".format(result["incorrect"]))
-        logging.info("   accuracy: {}\%".format(result["accuracy"]))
+        logging.info("   accuracy: {}%".format(result["accuracy"]))
 
 def command_line_args():
     parser = argparse.ArgumentParser()
