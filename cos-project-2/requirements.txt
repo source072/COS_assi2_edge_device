@@ -1,0 +1,7 @@
+requests==2.22.0
+flask
+flask_restful
+numpy
+keras
+tensorflow
+scikit-learn
